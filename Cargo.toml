@@ -1,0 +1,11 @@
+[package]
+name = "rust_troller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.95"
+bytes = "1.9.0"
+rodio = "0.20.1"
+tokio = { version = "1.43.0", features = ["full"] }
+windows-service = "0.7.0"
