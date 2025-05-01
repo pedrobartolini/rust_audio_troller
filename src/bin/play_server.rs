@@ -1,80 +1,73 @@
-use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
-pub const PUBLIC_IP: &str = "127.0.0.1";
 pub const PORT: u16 = 6969;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()>
-{
-    let mut args = std::env::args().into_iter();
+async fn main() -> anyhow::Result<()> {
+    let file_path = std::env::args().into_iter().skip(1).next().unwrap();
 
-    let mut file_path = None;
-    let mut clients_count: Option<usize> = None;
+    println!("{}", file_path);
 
-    while let Some(arg) = args.next()
-    {
-        match arg.as_str()
-        {
-            "-file" => file_path = args.next(),
-            "-clients" => clients_count = args.next().map(|x| x.parse()).transpose()?,
-            _ => ()
+    let file_buffer = {
+        let mut file_buffer = Vec::new();
+        let mut file = tokio::fs::File::open(&file_path).await?;
+        loop {
+            if file.read_buf(&mut file_buffer).await? == 0 {
+                break;
+            }
         }
-    }
-
-    let file_path = file_path.ok_or(anyhow::anyhow!("file not specified (-file [string])"))?;
-    let clients_count = clients_count.ok_or(anyhow::anyhow!("clients count missing (-clients [u16])"))?;
-
-    let mut file = tokio::fs::File::open(&file_path).await?;
-    let mut file_buffer = Vec::new();
-    loop
-    {
-        if file.read_buf(&mut file_buffer).await? == 0
-        {
-            break;
-        }
-    }
+        file_buffer
+    };
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT)).await?;
     println!("SERVER\tPORT {}", PORT);
 
-    let clients_written = Arc::new(Mutex::new(HashSet::new()));
-
-    loop
-    {
-        if clients_written.lock().await.len() == clients_count
-        {
-            return Ok(());
+    let acceptor = async move |streams: &mut Vec<(TcpStream, SocketAddr)>| {
+        loop {
+            let Ok((stream, addr)) = listener.accept().await else { continue };
+            streams.push((stream, addr));
         }
+    };
 
-        if let Ok(Ok((stream, sockaddr))) = tokio::time::timeout(tokio::time::Duration::from_millis(200), listener.accept()).await
-        {
-            if clients_written.lock().await.contains(&sockaddr.ip())
-            {
-                continue;
-            }
+    let mut streams = Vec::new();
 
-            tokio::spawn(client(stream, sockaddr.ip(), file_buffer.clone(), clients_written.clone()));
+    tokio::select! {
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => (),
+        _ = acceptor(&mut streams) => (),
+    };
+
+    let clients_written = Arc::new(RwLock::new(0));
+
+    let streams_count = streams.len();
+    for (stream, addr) in streams {
+        tokio::spawn(client(stream, addr.ip(), file_buffer.clone(), clients_written.clone()));
+    }
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        if *clients_written.read().await == streams_count {
+            break Ok(());
         }
     }
 }
 
-async fn client(mut stream: TcpStream, ipaddr: IpAddr, file_buffer: Vec<u8>, clients_written: Arc<Mutex<HashSet<IpAddr>>>) -> anyhow::Result<()>
-{
+async fn client(mut stream: TcpStream, ipaddr: IpAddr, file_buffer: Vec<u8>, clients_written: Arc<RwLock<usize>>) -> anyhow::Result<()> {
     println!("CLIENT\t{}\tCONNECTED", ipaddr);
 
-    stream.write_all(&file_buffer).await?;
+    let result = stream.write_all(&file_buffer).await;
 
-    clients_written.lock().await.insert(ipaddr);
+    *clients_written.write().await += 1;
 
-    println!("CLIENT\t{}\tFILE SENT", ipaddr);
-
-    stream.shutdown().await?;
+    if result.is_ok() {
+        println!("CLIENT\t{}\tFILE SENT", ipaddr);
+        stream.shutdown().await?;
+    }
 
     println!("CLIENT\t{}\tDISCONNECTED", ipaddr);
 
